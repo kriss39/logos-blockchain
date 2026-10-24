@@ -308,7 +308,7 @@ fn coerce_at_path(
     };
 
     if is_duration_like_yaml(existing) {
-        return coerce_seconds(existing, value, full_path);
+        return coerce_seconds(value, full_path);
     }
 
     if is_byte_sequence_like_yaml(existing) {
@@ -318,11 +318,7 @@ fn coerce_at_path(
     Ok(value)
 }
 
-fn coerce_seconds(
-    existing: &YamlValue,
-    value: YamlValue,
-    full_path: &str,
-) -> Result<YamlValue, StepError> {
+fn coerce_seconds(value: YamlValue, full_path: &str) -> Result<YamlValue, StepError> {
     let Some(raw) = value.as_str() else {
         return Ok(value);
     };
@@ -341,7 +337,7 @@ fn coerce_seconds(
         ));
     }
 
-    Ok(duration_yaml(existing, seconds, nanos))
+    Ok(duration_yaml(seconds, nanos))
 }
 
 fn coerce_string_to_bytes(value: YamlValue, full_path: &str) -> Result<YamlValue, StepError> {
@@ -392,55 +388,19 @@ fn parse_seconds_parts(raw: &str) -> Option<(i64, u32)> {
     None
 }
 
-fn duration_yaml(existing: &YamlValue, seconds: i64, nanos: u32) -> YamlValue {
-    match existing {
-        YamlValue::Sequence(_) => YamlValue::Sequence(vec![
-            YamlValue::from(seconds),
-            YamlValue::from(i64::from(nanos)),
-        ]),
-        YamlValue::Mapping(_) => {
-            let mut map = Mapping::new();
-            map.insert(
-                YamlValue::String("secs".to_owned()),
-                YamlValue::from(seconds),
-            );
-            map.insert(
-                YamlValue::String("nanos".to_owned()),
-                YamlValue::from(i64::from(nanos)),
-            );
-            YamlValue::Mapping(map)
-        }
-        _ => YamlValue::String(format!("{seconds}.{nanos:09}")),
-    }
+fn duration_yaml(seconds: i64, nanos: u32) -> YamlValue {
+    YamlValue::String(
+        humantime::format_duration(std::time::Duration::new(seconds.unsigned_abs(), nanos))
+            .to_string(),
+    )
 }
 
 fn is_duration_like_yaml(value: &YamlValue) -> bool {
-    match value {
-        YamlValue::String(v) => is_duration_string(v),
-        YamlValue::Sequence(v) => {
-            v.len() == 2
-                && yaml_integer_to_i64(&v[0]).is_some()
-                && yaml_integer_to_i64(&v[1]).is_some()
-        }
-        YamlValue::Mapping(v) => {
-            let secs = v
-                .get(YamlValue::String("secs".to_owned()))
-                .and_then(yaml_integer_to_i64);
-            let nanos = v
-                .get(YamlValue::String("nanos".to_owned()))
-                .and_then(yaml_integer_to_i64);
-            secs.is_some() && nanos.is_some()
-        }
-        _ => false,
-    }
+    value.as_str().is_some_and(is_duration_string)
 }
 
 fn is_duration_string(value: &str) -> bool {
-    let Some((secs, nanos)) = value.split_once('.') else {
-        return false;
-    };
-
-    is_ascii_digits(secs) && nanos.len() == 9 && is_ascii_digits(nanos)
+    humantime::parse_duration(value).is_ok()
 }
 
 // ============================================================
@@ -451,7 +411,7 @@ fn get_at_path<'a>(current: &'a YamlValue, path: &[&str]) -> Option<&'a YamlValu
     let mut current = current;
 
     for segment in path {
-        current = match current {
+        current = match untagged(current) {
             YamlValue::Sequence(sequence) => sequence.get(segment.parse::<usize>().ok()?)?,
             YamlValue::Mapping(mapping) => mapping.get(mapping_key(mapping, segment))?,
             _ => return None,
@@ -472,6 +432,9 @@ fn set_at_path(
         return Ok(());
     }
 
+    // A tag, such as an era's ruleset (`eras.0` is `!V1 {...}`), is stepped
+    // through: the segment reads the value it tags.
+    let current = untagged_mut(current);
     let segment = path[0];
     let rest = &path[1..];
     let is_last = rest.is_empty();
@@ -552,6 +515,23 @@ fn set_map(
     set_at_path(child, rest, value, full_path)
 }
 
+/// The value `value` tags, through any number of tags, or `value` itself when
+/// it carries none.
+fn untagged(mut value: &YamlValue) -> &YamlValue {
+    while let YamlValue::Tagged(tagged) = value {
+        value = &tagged.value;
+    }
+    value
+}
+
+/// See [`untagged`].
+fn untagged_mut(mut value: &mut YamlValue) -> &mut YamlValue {
+    while let YamlValue::Tagged(tagged) = value {
+        value = &mut tagged.value;
+    }
+    value
+}
+
 /// The key `segment` names in `mapping`: the integer key it spells out when
 /// the mapping holds one, and otherwise the string itself.
 fn mapping_key(mapping: &Mapping, segment: &str) -> YamlValue {
@@ -577,13 +557,6 @@ fn default_child(rest: &[&str]) -> YamlValue {
 // ============================================================
 // Small utilities
 // ============================================================
-
-fn yaml_integer_to_i64(value: &YamlValue) -> Option<i64> {
-    value.as_i64().or_else(|| {
-        let u = value.as_u64()?;
-        i64::try_from(u).ok()
-    })
-}
 
 fn normalize_nanos(fraction: &str) -> String {
     if fraction.len() >= 9 {
@@ -735,7 +708,7 @@ mod tests {
         };
         let override_3 = ConfigOverride {
             path: "cryptarchia.service.bootstrap.prolonged_bootstrap_period".to_owned(),
-            value: serde_yaml::to_value(TimeDuration::ZERO).expect("yaml value"),
+            value: "0s".into(),
         };
         assert!(
             apply_user_config_overrides(&mut config, &[override_1, override_2, override_3]).is_ok()
@@ -762,8 +735,8 @@ mod tests {
             .security_param
             .get();
         let override_4 = ConfigOverride {
-            path: "eras.0.time.slot_duration".to_owned(),
-            value: serde_yaml::to_value(TimeDuration::new(1, 0)).expect("yaml value"),
+            path: "eras.0.time.slot_duration_in_seconds".to_owned(),
+            value: serde_yaml::to_value(1u64).expect("yaml value"),
         };
         let override_5 = ConfigOverride {
             path: "eras.0.cryptarchia.security_param".to_owned(),
@@ -775,7 +748,7 @@ mod tests {
                 .deployment
                 .genesis_era_parameters()
                 .time
-                .slot_duration,
+                .slot_duration(),
             Duration::from_secs(1)
         );
         assert_eq!(
@@ -787,6 +760,70 @@ mod tests {
                 .get(),
             security_param + 1
         );
+    }
+
+    #[test]
+    fn testnet_representative_profile_applies_epoch_and_blend_settings() {
+        let mut config = test_run_config("testnet_blend_diagnostic_overrides");
+        let mut world = CucumberWorld::default();
+        let temp_dir = tempfile::tempdir().expect("temporary directory should be created");
+        world.lifecycle.scenario_base_dir = temp_dir.path().to_owned();
+
+        crate::cucumber::steps::nodes::diagnostics::set_blend_diagnostic_parameter_set(
+            &mut world,
+            "test-step",
+            "testnet_representative",
+        )
+        .expect("testnet representative profile");
+
+        set_deployment_config_override(
+            &mut world,
+            "test-step",
+            "eras.0.blend.common.num_blend_layers",
+            "1",
+        )
+        .expect("Blend layer override");
+        set_deployment_config_override(
+            &mut world,
+            "test-step",
+            "eras.0.blend.common.data_replication_factor",
+            "1",
+        )
+        .expect("Blend replication override");
+        set_deployment_config_override(
+            &mut world,
+            "test-step",
+            "eras.0.blend.core.scheduler.delayer.maximum_release_delay_in_rounds",
+            "1",
+        )
+        .expect("Blend release delay override");
+
+        world
+            .startup
+            .manual_node_config_overrides
+            .apply_to(&mut config);
+        apply_deployment_config_overrides(&mut config, &world.startup.deployment_config_overrides)
+            .expect("apply diagnostic deployment overrides");
+
+        let cryptarchia = &config.deployment.genesis_era_parameters().cryptarchia;
+        assert_eq!(cryptarchia.security_param.get(), 10);
+        assert_eq!(cryptarchia.slot_activation_coeff.numerator, 1);
+        assert_eq!(cryptarchia.slot_activation_coeff.denominator.get(), 30);
+        assert_eq!(cryptarchia.slots_per_epoch(), 3_000);
+
+        let blend = &config.deployment.genesis_era_parameters().blend;
+        assert_eq!(blend.common.num_blend_layers.get(), 1);
+        assert_eq!(blend.common.data_replication_factor, 1);
+        assert_eq!(
+            blend
+                .core
+                .scheduler
+                .delayer
+                .maximum_release_delay_in_rounds
+                .get(),
+            1
+        );
+        assert_eq!(blend.common.network_absorption_in_rounds.get(), 2);
     }
 
     #[test]
@@ -811,10 +848,10 @@ mod tests {
         set_deployment_config_override(
             &mut world,
             "test-step",
-            "eras.0.time.slot_duration",
-            "seconds(1)",
+            "eras.0.time.slot_duration_in_seconds",
+            "1",
         )
-        .expect("deployment duration override");
+        .expect("deployment slot duration override");
         set_deployment_config_override(
             &mut world,
             "test-step",
@@ -852,7 +889,7 @@ mod tests {
                 .deployment
                 .genesis_era_parameters()
                 .time
-                .slot_duration,
+                .slot_duration(),
             Duration::from_secs(1)
         );
     }
@@ -999,7 +1036,7 @@ mod tests {
             let mut m = Mapping::new();
             m.insert(
                 YamlValue::String("duration".to_owned()),
-                YamlValue::String("0.000000000".to_owned()),
+                YamlValue::String("0s".to_owned()),
             );
             m
         });
@@ -1008,7 +1045,7 @@ mod tests {
         let result = coerce_at_path(&root, &["duration"], parsed, "duration")
             .expect("coerce should succeed");
 
-        assert_eq!(result.as_str(), Some("1.200000000"));
+        assert_eq!(result.as_str(), Some("1s 200ms"));
     }
 }
 

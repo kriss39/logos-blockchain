@@ -6,7 +6,7 @@ use std::{
 use ::libp2p::PeerId;
 use axum::{
     Extension, Json,
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, rejection::JsonRejection},
     http::StatusCode,
     response::{IntoResponse as _, Response},
 };
@@ -40,7 +40,7 @@ use lb_core::{
     sdp::ServiceType,
 };
 use lb_http_api_common::{
-    TimeInfo,
+    EraTiming, TimeInfo,
     bodies::{
         blend::JoinBlendRequestBody,
         chain::ChainIdResponseBody,
@@ -65,7 +65,7 @@ use lb_sdp_service::{
     mempool::SdpMempoolAdapter, state::SdpStateStorage, wallet::SdpWalletAdapter,
 };
 use lb_storage_service::{StorageService, api::StorageApi};
-use lb_time_service::TimeServiceMessage;
+use lb_time_service::{TimeServiceMessage, backends::NtpTimeBackend};
 use lb_tx_service::{
     MempoolMsg, TxMempoolService, backend::Mempool,
     network::adapters::libp2p::Libp2pAdapter as MempoolNetworkAdapter,
@@ -405,12 +405,14 @@ where
                     RuntimeServiceId,
                 >,
                 StorageAdapter,
+                NtpTimeBackend,
                 RuntimeServiceId,
             >,
         >,
 {
     make_request_and_return_response!(mantle::mantle_mempool_metrics::<
         StorageAdapter,
+        NtpTimeBackend,
         RuntimeServiceId,
     >(&handle))
 }
@@ -459,12 +461,14 @@ where
                     RuntimeServiceId,
                 >,
                 StorageAdapter,
+                NtpTimeBackend,
                 RuntimeServiceId,
             >,
         >,
 {
     make_request_and_return_response!(mantle::mantle_mempool_status::<
         StorageAdapter,
+        NtpTimeBackend,
         RuntimeServiceId,
     >(&handle, items))
 }
@@ -543,17 +547,27 @@ where
         return ApiError::internal(error).into_response();
     }
     match receiver.await {
-        Ok(Ok(service_info)) => {
+        Ok(service_info) => {
             let api_info = TimeInfo {
-                slot_duration_ms: service_info.slot_duration_ms,
-                genesis_time_unix_ms: service_info.genesis_time_unix_ms,
+                genesis_time: service_info.genesis_time().to_utc(),
                 current_slot: u64::from(service_info.current_slot),
                 current_epoch: u32::from(service_info.current_epoch),
-                slots_per_epoch: service_info.slots_per_epoch,
+                era_timings: service_info
+                    .era_schedules
+                    .iter()
+                    .map(|era| {
+                        (
+                            era.first_epoch.into_inner(),
+                            EraTiming {
+                                slot_duration: era.parameters.slot_duration,
+                                slots_per_epoch: era.parameters.epoch_length,
+                            },
+                        )
+                    })
+                    .collect(),
             };
             (StatusCode::OK, Json(api_info)).into_response()
         }
-        Ok(Err(error)) => ApiError::internal_message(error).into_response(),
         Err(error) => ApiError::internal(error).into_response(),
     }
 }
@@ -618,9 +632,11 @@ where
         + Sync
         + Display
         + 'static
-        + AsServiceId<NetworkService<Libp2pNetworkBackend, RuntimeServiceId>>,
+        + AsServiceId<NetworkService<Libp2pNetworkBackend, NtpTimeBackend, RuntimeServiceId>>,
 {
-    make_request_and_return_response!(libp2p::libp2p_info::<RuntimeServiceId>(&handle))
+    make_request_and_return_response!(libp2p::libp2p_info::<NtpTimeBackend, RuntimeServiceId>(
+        &handle
+    ))
 }
 
 #[utoipa::path(
@@ -642,10 +658,11 @@ where
         + Sync
         + Display
         + 'static
-        + AsServiceId<NetworkService<Libp2pNetworkBackend, RuntimeServiceId>>,
+        + AsServiceId<NetworkService<Libp2pNetworkBackend, NtpTimeBackend, RuntimeServiceId>>,
 {
     make_request_and_return_response!(async move {
-        let peer_id = libp2p::connect_peer::<RuntimeServiceId>(&handle, req.addr).await?;
+        let peer_id =
+            libp2p::connect_peer::<NtpTimeBackend, RuntimeServiceId>(&handle, req.addr).await?;
         Ok::<PeerId, overwatch::DynError>(peer_id)
     })
 }
@@ -753,18 +770,19 @@ where
 
     let chain =
         CryptarchiaServiceApi::<Cryptarchia<RuntimeServiceId>>::from_overwatch_handle(handle).await;
-    let threshold = chain
-        .get_ledger_config()
-        .await
-        .map_err(ApiError::internal)?
-        .sdp_config
-        .min_stake
-        .threshold;
     let ledger = chain
         .get_ledger_state(tip)
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::internal_message(format!("no ledger state at tip {tip:?}")))?;
+    // The minimum stake of the era of the tip the balance is read at.
+    let threshold = chain
+        .get_ledger_config(ledger.slot())
+        .await
+        .map_err(ApiError::internal)?
+        .sdp_config
+        .min_stake
+        .threshold;
     let locked = ledger.mantle_ledger().service_notes();
 
     let notes: Vec<_> = balance.notes.into_iter().collect();
@@ -871,6 +889,7 @@ where
                     RuntimeServiceId,
                 >,
                 StorageAdapter,
+                NtpTimeBackend,
                 RuntimeServiceId,
             >,
         >,
@@ -884,6 +903,7 @@ where
         >,
         StorageAdapter,
         SignedOps<Preverified, StandardMode>,
+        NtpTimeBackend,
         RuntimeServiceId,
     >(&handle, tx, Hashable::hash))
 }
@@ -932,6 +952,7 @@ where
                     RuntimeServiceId,
                 >,
                 StorageAdapter,
+                NtpTimeBackend,
                 RuntimeServiceId,
             >,
         >,
@@ -977,6 +998,7 @@ where
                     RuntimeServiceId,
                 >,
                 StorageAdapter,
+                NtpTimeBackend,
                 RuntimeServiceId,
             >,
         >,
@@ -1023,6 +1045,7 @@ where
                     RuntimeServiceId,
                 >,
                 StorageAdapter,
+                NtpTimeBackend,
                 RuntimeServiceId,
             >,
         >,
@@ -1041,6 +1064,7 @@ where
                 RuntimeServiceId,
             >,
             StorageAdapter,
+            NtpTimeBackend,
             RuntimeServiceId,
         >>()
         .await?;
@@ -1136,6 +1160,7 @@ where
                     RuntimeServiceId,
                 >,
                 StorageAdapter,
+                NtpTimeBackend,
                 RuntimeServiceId,
             >,
         >,
@@ -1176,6 +1201,7 @@ where
             >,
             StorageAdapter,
             SignedOps<Preverified, StandardMode>,
+            NtpTimeBackend,
             RuntimeServiceId,
         >(&handle, signed_tx, Hashable::hash)
         .await?;
@@ -1607,13 +1633,13 @@ pub async fn pow_claim<PoW, RuntimeServiceId>(
     State(handle): State<OverwatchHandle<RuntimeServiceId>>,
     // An absent or empty body means "pay the auto-claim target", so the body
     // is optional rather than required.
-    body: Option<Json<pow::PoWClaimRequestBody>>,
+    body: Result<Json<pow::PoWClaimRequestBody>, JsonRejection>,
 ) -> Response
 where
     PoW: PoWServiceData,
     RuntimeServiceId: Debug + Send + Sync + Display + 'static + AsServiceId<PoW>,
 {
-    let claim_address = body.and_then(|Json(body)| body.claim_address);
+    let claim_address = body.ok().and_then(|Json(body)| body.claim_address);
     make_request_and_return_response!(pow::claim::<PoW, RuntimeServiceId>(&handle, claim_address))
 }
 
@@ -2160,6 +2186,7 @@ pub mod wallet {
                         RuntimeServiceId,
                     >,
                     StorageAdapter,
+                    NtpTimeBackend,
                     RuntimeServiceId,
                 >,
             >,
@@ -2197,6 +2224,7 @@ pub mod wallet {
                     >,
                     StorageAdapter,
                     SignedOps<Preverified, StandardMode>,
+                    NtpTimeBackend,
                     RuntimeServiceId,
                 >(&handle, transaction.clone(), Hashable::hash)
                 .await
@@ -2256,6 +2284,7 @@ pub mod wallet {
                         RuntimeServiceId,
                     >,
                     StorageAdapter,
+                    NtpTimeBackend,
                     RuntimeServiceId,
                 >,
             >,
@@ -2316,6 +2345,7 @@ pub mod wallet {
                         RuntimeServiceId,
                     >,
                     StorageAdapter,
+                    NtpTimeBackend,
                     RuntimeServiceId,
                 >,
             >,
@@ -2376,6 +2406,7 @@ pub mod wallet {
                         RuntimeServiceId,
                     >,
                     StorageAdapter,
+                    NtpTimeBackend,
                     RuntimeServiceId,
                 >,
             >,
