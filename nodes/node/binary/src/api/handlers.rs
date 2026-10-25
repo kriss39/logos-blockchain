@@ -37,7 +37,7 @@ use lb_core::{
             states::{Preverified, Unverified},
         },
     },
-    sdp::ServiceType,
+    sdp::{DeclarationId, ServiceType},
 };
 use lb_http_api_common::{
     EraTiming, TimeInfo,
@@ -1322,7 +1322,7 @@ pub async fn post_withdrawal<
     RuntimeServiceId,
 >(
     State(handle): State<OverwatchHandle<RuntimeServiceId>>,
-    Json(declaration_id): Json<lb_core::sdp::DeclarationId>,
+    Json(declaration_id): Json<DeclarationId>,
 ) -> Response
 where
     MempoolAdapter: SdpMempoolAdapter + Send + Sync + 'static,
@@ -1358,7 +1358,7 @@ where
     post,
     path = paths::SDP_POST_SET_DECLARATION_ID,
     responses(
-        (status = 200, description = "Post declaration to SDP service to be set as current", body = lb_core::sdp::DeclarationId),
+        (status = 200, description = "Post declaration to SDP service to be set as current", body = DeclarationId),
         (status = 500, description = "Internal server error", body = ErrorBody),
     )
 )]
@@ -1370,7 +1370,7 @@ pub async fn post_set_declaration_id<
     RuntimeServiceId,
 >(
     State(handle): State<OverwatchHandle<RuntimeServiceId>>,
-    Json(declaration): Json<Option<lb_core::sdp::DeclarationId>>,
+    Json(declaration): Json<Option<DeclarationId>>,
 ) -> Response
 where
     MempoolAdapter: SdpMempoolAdapter + Send + Sync + 'static,
@@ -1408,7 +1408,7 @@ where
     get,
     path = paths::MANTLE_SDP_DECLARATIONS,
     responses(
-        (status = 200, description = "Get current SDP declarations keyed by declaration id", body = std::collections::HashMap<lb_core::sdp::DeclarationId, Object>),
+        (status = 200, description = "Get current SDP declarations keyed by declaration id", body = std::collections::HashMap<DeclarationId, Object>),
         (status = 500, description = "Internal server error", body = ErrorBody),
     )
 )]
@@ -1426,7 +1426,7 @@ where
     get,
     path = paths::MANTLE_SDP_SNAPSHOT,
     responses(
-        (status = 200, description = "Get the SDP snapshot for the current epoch keyed by declaration id", body = std::collections::HashMap<lb_core::sdp::DeclarationId, Object>),
+        (status = 200, description = "Get the SDP snapshot for the current epoch keyed by declaration id", body = std::collections::HashMap<DeclarationId, Object>),
         (status = 500, description = "Internal server error", body = ErrorBody),
     )
 )]
@@ -1461,7 +1461,7 @@ where
     RuntimeServiceId:
         Debug + Send + Sync + Display + 'static + AsServiceId<Cryptarchia<RuntimeServiceId>>,
 {
-    let declaration_id = match parse_declaration_id(&declaration_id) {
+    let declaration_id = match declaration_id.parse::<DeclarationId>() {
         Ok(id) => id,
         Err(error) => return ApiError::BadRequest(error).into_response(),
     };
@@ -1482,7 +1482,7 @@ where
         ("service_type" = u8, Path, description = "Canonical one-byte ServiceType discriminant")
     ),
     responses(
-        (status = 200, description = "Declarations of the service from finalized SDP state", body = std::collections::HashMap<lb_core::sdp::DeclarationId, Object>),
+        (status = 200, description = "Declarations of the service from finalized SDP state", body = std::collections::HashMap<DeclarationId, Object>),
         (status = 400, description = "Unknown service type", body = ErrorBody),
         (status = 404, description = "Service is absent from finalized state", body = ErrorBody),
         (status = 500, description = "Internal server error", body = ErrorBody),
@@ -1507,27 +1507,6 @@ where
         }
         Err(error) => ApiError::Internal(error).into_response(),
     }
-}
-
-fn parse_declaration_id(encoded: &str) -> Result<lb_core::sdp::DeclarationId, String> {
-    let encoded = encoded.strip_prefix("0x").unwrap_or(encoded);
-    if encoded.len() != 64 {
-        return Err("Declaration ID must contain exactly 32 bytes of hex".into());
-    }
-
-    let mut bytes = [0; 32];
-    let (hex_pairs, _) = encoded.as_bytes().as_chunks::<2>();
-    for (byte, pair) in bytes.iter_mut().zip(hex_pairs) {
-        let high = (pair[0] as char)
-            .to_digit(16)
-            .ok_or_else(|| "Declaration ID contains invalid hex".to_owned())?;
-        let low = (pair[1] as char)
-            .to_digit(16)
-            .ok_or_else(|| "Declaration ID contains invalid hex".to_owned())?;
-        *byte = ((high << 4) | low) as u8;
-    }
-
-    Ok(lb_core::sdp::DeclarationId(bytes))
 }
 
 #[utoipa::path(

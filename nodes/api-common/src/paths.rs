@@ -3,9 +3,9 @@ pub const MANTLE_STATUS: &str = "/mantle/status";
 pub const MANTLE_SDP_DECLARATIONS: &str = "/mantle/sdp/declarations";
 pub const MANTLE_SDP_SNAPSHOT: &str = "/mantle/sdp/snapshot";
 pub const MANTLE_SDP_FINALIZED_DECLARATION: &str =
-    "/mantle/sdp/finalized/declaration/:declaration_id";
+    "/mantle/sdp/finalized/declaration/{declaration_id}";
 pub const MANTLE_SDP_FINALIZED_DECLARATIONS: &str =
-    "/mantle/sdp/finalized/declarations/:service_type";
+    "/mantle/sdp/finalized/declarations/{service_type}";
 pub const MANTLE_GAS_PRICES: &str = "/mantle/gas-prices";
 pub const CHAIN_ID: &str = "/chain/id";
 pub const CRYPTARCHIA_INFO: &str = "/cryptarchia/info";
