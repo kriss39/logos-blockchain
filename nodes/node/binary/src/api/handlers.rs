@@ -6,7 +6,7 @@ use std::{
 use ::libp2p::PeerId;
 use axum::{
     Extension, Json,
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, rejection::JsonRejection},
     http::StatusCode,
     response::{IntoResponse as _, Response},
 };
@@ -37,10 +37,10 @@ use lb_core::{
             states::{Preverified, Unverified},
         },
     },
-    sdp::ServiceType,
+    sdp::{DeclarationId, ServiceType},
 };
 use lb_http_api_common::{
-    TimeInfo,
+    EraTiming, TimeInfo,
     bodies::{
         blend::JoinBlendRequestBody,
         chain::ChainIdResponseBody,
@@ -65,7 +65,7 @@ use lb_sdp_service::{
     mempool::SdpMempoolAdapter, state::SdpStateStorage, wallet::SdpWalletAdapter,
 };
 use lb_storage_service::{StorageService, api::StorageApi};
-use lb_time_service::TimeServiceMessage;
+use lb_time_service::{TimeServiceMessage, backends::NtpTimeBackend};
 use lb_tx_service::{
     MempoolMsg, TxMempoolService, backend::Mempool,
     network::adapters::libp2p::Libp2pAdapter as MempoolNetworkAdapter,
@@ -405,12 +405,14 @@ where
                     RuntimeServiceId,
                 >,
                 StorageAdapter,
+                NtpTimeBackend,
                 RuntimeServiceId,
             >,
         >,
 {
     make_request_and_return_response!(mantle::mantle_mempool_metrics::<
         StorageAdapter,
+        NtpTimeBackend,
         RuntimeServiceId,
     >(&handle))
 }
@@ -459,12 +461,14 @@ where
                     RuntimeServiceId,
                 >,
                 StorageAdapter,
+                NtpTimeBackend,
                 RuntimeServiceId,
             >,
         >,
 {
     make_request_and_return_response!(mantle::mantle_mempool_status::<
         StorageAdapter,
+        NtpTimeBackend,
         RuntimeServiceId,
     >(&handle, items))
 }
@@ -543,17 +547,27 @@ where
         return ApiError::internal(error).into_response();
     }
     match receiver.await {
-        Ok(Ok(service_info)) => {
+        Ok(service_info) => {
             let api_info = TimeInfo {
-                slot_duration_ms: service_info.slot_duration_ms,
-                genesis_time_unix_ms: service_info.genesis_time_unix_ms,
+                genesis_time: service_info.genesis_time().to_utc(),
                 current_slot: u64::from(service_info.current_slot),
                 current_epoch: u32::from(service_info.current_epoch),
-                slots_per_epoch: service_info.slots_per_epoch,
+                era_timings: service_info
+                    .era_schedules
+                    .iter()
+                    .map(|era| {
+                        (
+                            era.first_epoch.into_inner(),
+                            EraTiming {
+                                slot_duration: era.parameters.slot_duration,
+                                slots_per_epoch: era.parameters.epoch_length,
+                            },
+                        )
+                    })
+                    .collect(),
             };
             (StatusCode::OK, Json(api_info)).into_response()
         }
-        Ok(Err(error)) => ApiError::internal_message(error).into_response(),
         Err(error) => ApiError::internal(error).into_response(),
     }
 }
@@ -618,9 +632,11 @@ where
         + Sync
         + Display
         + 'static
-        + AsServiceId<NetworkService<Libp2pNetworkBackend, RuntimeServiceId>>,
+        + AsServiceId<NetworkService<Libp2pNetworkBackend, NtpTimeBackend, RuntimeServiceId>>,
 {
-    make_request_and_return_response!(libp2p::libp2p_info::<RuntimeServiceId>(&handle))
+    make_request_and_return_response!(libp2p::libp2p_info::<NtpTimeBackend, RuntimeServiceId>(
+        &handle
+    ))
 }
 
 #[utoipa::path(
@@ -642,10 +658,11 @@ where
         + Sync
         + Display
         + 'static
-        + AsServiceId<NetworkService<Libp2pNetworkBackend, RuntimeServiceId>>,
+        + AsServiceId<NetworkService<Libp2pNetworkBackend, NtpTimeBackend, RuntimeServiceId>>,
 {
     make_request_and_return_response!(async move {
-        let peer_id = libp2p::connect_peer::<RuntimeServiceId>(&handle, req.addr).await?;
+        let peer_id =
+            libp2p::connect_peer::<NtpTimeBackend, RuntimeServiceId>(&handle, req.addr).await?;
         Ok::<PeerId, overwatch::DynError>(peer_id)
     })
 }
@@ -753,18 +770,19 @@ where
 
     let chain =
         CryptarchiaServiceApi::<Cryptarchia<RuntimeServiceId>>::from_overwatch_handle(handle).await;
-    let threshold = chain
-        .get_ledger_config()
-        .await
-        .map_err(ApiError::internal)?
-        .sdp_config
-        .min_stake
-        .threshold;
     let ledger = chain
         .get_ledger_state(tip)
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::internal_message(format!("no ledger state at tip {tip:?}")))?;
+    // The minimum stake of the era of the tip the balance is read at.
+    let threshold = chain
+        .get_ledger_config(ledger.slot())
+        .await
+        .map_err(ApiError::internal)?
+        .sdp_config
+        .min_stake
+        .threshold;
     let locked = ledger.mantle_ledger().service_notes();
 
     let notes: Vec<_> = balance.notes.into_iter().collect();
@@ -871,6 +889,7 @@ where
                     RuntimeServiceId,
                 >,
                 StorageAdapter,
+                NtpTimeBackend,
                 RuntimeServiceId,
             >,
         >,
@@ -884,6 +903,7 @@ where
         >,
         StorageAdapter,
         SignedOps<Preverified, StandardMode>,
+        NtpTimeBackend,
         RuntimeServiceId,
     >(&handle, tx, Hashable::hash))
 }
@@ -932,6 +952,7 @@ where
                     RuntimeServiceId,
                 >,
                 StorageAdapter,
+                NtpTimeBackend,
                 RuntimeServiceId,
             >,
         >,
@@ -977,6 +998,7 @@ where
                     RuntimeServiceId,
                 >,
                 StorageAdapter,
+                NtpTimeBackend,
                 RuntimeServiceId,
             >,
         >,
@@ -1023,6 +1045,7 @@ where
                     RuntimeServiceId,
                 >,
                 StorageAdapter,
+                NtpTimeBackend,
                 RuntimeServiceId,
             >,
         >,
@@ -1041,6 +1064,7 @@ where
                 RuntimeServiceId,
             >,
             StorageAdapter,
+            NtpTimeBackend,
             RuntimeServiceId,
         >>()
         .await?;
@@ -1136,6 +1160,7 @@ where
                     RuntimeServiceId,
                 >,
                 StorageAdapter,
+                NtpTimeBackend,
                 RuntimeServiceId,
             >,
         >,
@@ -1176,6 +1201,7 @@ where
             >,
             StorageAdapter,
             SignedOps<Preverified, StandardMode>,
+            NtpTimeBackend,
             RuntimeServiceId,
         >(&handle, signed_tx, Hashable::hash)
         .await?;
@@ -1296,7 +1322,7 @@ pub async fn post_withdrawal<
     RuntimeServiceId,
 >(
     State(handle): State<OverwatchHandle<RuntimeServiceId>>,
-    Json(declaration_id): Json<lb_core::sdp::DeclarationId>,
+    Json(declaration_id): Json<DeclarationId>,
 ) -> Response
 where
     MempoolAdapter: SdpMempoolAdapter + Send + Sync + 'static,
@@ -1332,7 +1358,7 @@ where
     post,
     path = paths::SDP_POST_SET_DECLARATION_ID,
     responses(
-        (status = 200, description = "Post declaration to SDP service to be set as current", body = lb_core::sdp::DeclarationId),
+        (status = 200, description = "Post declaration to SDP service to be set as current", body = DeclarationId),
         (status = 500, description = "Internal server error", body = ErrorBody),
     )
 )]
@@ -1344,7 +1370,7 @@ pub async fn post_set_declaration_id<
     RuntimeServiceId,
 >(
     State(handle): State<OverwatchHandle<RuntimeServiceId>>,
-    Json(declaration): Json<Option<lb_core::sdp::DeclarationId>>,
+    Json(declaration): Json<Option<DeclarationId>>,
 ) -> Response
 where
     MempoolAdapter: SdpMempoolAdapter + Send + Sync + 'static,
@@ -1382,7 +1408,7 @@ where
     get,
     path = paths::MANTLE_SDP_DECLARATIONS,
     responses(
-        (status = 200, description = "Get current SDP declarations keyed by declaration id", body = std::collections::HashMap<lb_core::sdp::DeclarationId, Object>),
+        (status = 200, description = "Get current SDP declarations keyed by declaration id", body = std::collections::HashMap<DeclarationId, Object>),
         (status = 500, description = "Internal server error", body = ErrorBody),
     )
 )]
@@ -1400,7 +1426,7 @@ where
     get,
     path = paths::MANTLE_SDP_SNAPSHOT,
     responses(
-        (status = 200, description = "Get the SDP snapshot for the current epoch keyed by declaration id", body = std::collections::HashMap<lb_core::sdp::DeclarationId, Object>),
+        (status = 200, description = "Get the SDP snapshot for the current epoch keyed by declaration id", body = std::collections::HashMap<DeclarationId, Object>),
         (status = 500, description = "Internal server error", body = ErrorBody),
     )
 )]
@@ -1435,7 +1461,7 @@ where
     RuntimeServiceId:
         Debug + Send + Sync + Display + 'static + AsServiceId<Cryptarchia<RuntimeServiceId>>,
 {
-    let declaration_id = match parse_declaration_id(&declaration_id) {
+    let declaration_id = match declaration_id.parse::<DeclarationId>() {
         Ok(id) => id,
         Err(error) => return ApiError::BadRequest(error).into_response(),
     };
@@ -1456,7 +1482,7 @@ where
         ("service_type" = u8, Path, description = "Canonical one-byte ServiceType discriminant")
     ),
     responses(
-        (status = 200, description = "Declarations of the service from finalized SDP state", body = std::collections::HashMap<lb_core::sdp::DeclarationId, Object>),
+        (status = 200, description = "Declarations of the service from finalized SDP state", body = std::collections::HashMap<DeclarationId, Object>),
         (status = 400, description = "Unknown service type", body = ErrorBody),
         (status = 404, description = "Service is absent from finalized state", body = ErrorBody),
         (status = 500, description = "Internal server error", body = ErrorBody),
@@ -1481,27 +1507,6 @@ where
         }
         Err(error) => ApiError::Internal(error).into_response(),
     }
-}
-
-fn parse_declaration_id(encoded: &str) -> Result<lb_core::sdp::DeclarationId, String> {
-    let encoded = encoded.strip_prefix("0x").unwrap_or(encoded);
-    if encoded.len() != 64 {
-        return Err("Declaration ID must contain exactly 32 bytes of hex".into());
-    }
-
-    let mut bytes = [0; 32];
-    let (hex_pairs, _) = encoded.as_bytes().as_chunks::<2>();
-    for (byte, pair) in bytes.iter_mut().zip(hex_pairs) {
-        let high = (pair[0] as char)
-            .to_digit(16)
-            .ok_or_else(|| "Declaration ID contains invalid hex".to_owned())?;
-        let low = (pair[1] as char)
-            .to_digit(16)
-            .ok_or_else(|| "Declaration ID contains invalid hex".to_owned())?;
-        *byte = ((high << 4) | low) as u8;
-    }
-
-    Ok(lb_core::sdp::DeclarationId(bytes))
 }
 
 #[utoipa::path(
@@ -1607,13 +1612,13 @@ pub async fn pow_claim<PoW, RuntimeServiceId>(
     State(handle): State<OverwatchHandle<RuntimeServiceId>>,
     // An absent or empty body means "pay the auto-claim target", so the body
     // is optional rather than required.
-    body: Option<Json<pow::PoWClaimRequestBody>>,
+    body: Result<Json<pow::PoWClaimRequestBody>, JsonRejection>,
 ) -> Response
 where
     PoW: PoWServiceData,
     RuntimeServiceId: Debug + Send + Sync + Display + 'static + AsServiceId<PoW>,
 {
-    let claim_address = body.and_then(|Json(body)| body.claim_address);
+    let claim_address = body.ok().and_then(|Json(body)| body.claim_address);
     make_request_and_return_response!(pow::claim::<PoW, RuntimeServiceId>(&handle, claim_address))
 }
 
@@ -2160,6 +2165,7 @@ pub mod wallet {
                         RuntimeServiceId,
                     >,
                     StorageAdapter,
+                    NtpTimeBackend,
                     RuntimeServiceId,
                 >,
             >,
@@ -2197,6 +2203,7 @@ pub mod wallet {
                     >,
                     StorageAdapter,
                     SignedOps<Preverified, StandardMode>,
+                    NtpTimeBackend,
                     RuntimeServiceId,
                 >(&handle, transaction.clone(), Hashable::hash)
                 .await
@@ -2256,6 +2263,7 @@ pub mod wallet {
                         RuntimeServiceId,
                     >,
                     StorageAdapter,
+                    NtpTimeBackend,
                     RuntimeServiceId,
                 >,
             >,
@@ -2316,6 +2324,7 @@ pub mod wallet {
                         RuntimeServiceId,
                     >,
                     StorageAdapter,
+                    NtpTimeBackend,
                     RuntimeServiceId,
                 >,
             >,
@@ -2376,6 +2385,7 @@ pub mod wallet {
                         RuntimeServiceId,
                     >,
                     StorageAdapter,
+                    NtpTimeBackend,
                     RuntimeServiceId,
                 >,
             >,
