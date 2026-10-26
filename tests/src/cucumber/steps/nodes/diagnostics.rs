@@ -168,6 +168,7 @@ fn diagnostic_node_sort_number(node_name: &str) -> Option<u32> {
 struct BlendDiagnosticParameterSet {
     name: &'static str,
     security_parameter: u32,
+    uncle_reference_window_in_block: u32,
     slot_duration_secs: u64,
     epoch_stake_distribution_stabilization: u8,
     epoch_period_nonce_buffer: u8,
@@ -184,6 +185,7 @@ impl BlendDiagnosticParameterSet {
             "clean_control" => Some(Self {
                 name: "clean_control",
                 security_parameter: 10,
+                uncle_reference_window_in_block: 6,
                 slot_duration_secs: 1,
                 epoch_stake_distribution_stabilization: 1,
                 epoch_period_nonce_buffer: 1,
@@ -196,6 +198,7 @@ impl BlendDiagnosticParameterSet {
             "testnet_representative" => Some(Self {
                 name: "testnet_representative",
                 security_parameter: 10,
+                uncle_reference_window_in_block: 6,
                 slot_duration_secs: 1,
                 epoch_stake_distribution_stabilization: 3,
                 epoch_period_nonce_buffer: 3,
@@ -208,6 +211,7 @@ impl BlendDiagnosticParameterSet {
             "fast_repro" => Some(Self {
                 name: "fast_repro",
                 security_parameter: 3,
+                uncle_reference_window_in_block: 1,
                 slot_duration_secs: 1,
                 epoch_stake_distribution_stabilization: 1,
                 epoch_period_nonce_buffer: 1,
@@ -218,23 +222,12 @@ impl BlendDiagnosticParameterSet {
         }
     }
 
-    /// Cap W at k - 1 (floor 1) to limit pruning-related instability while
-    /// retaining a nonzero window for meaningful uncle references.
-    fn uncle_reference_window_in_block(self) -> u32 {
-        let default_window = DeploymentSettings::default()
-            .genesis_era_parameters()
-            .cryptarchia
-            .uncle_reference_window_in_block
-            .get();
-        diagnostic_uncle_reference_window(default_window, self.security_parameter)
-    }
-
     fn apply_to(&self, settings: &mut DeploymentSettings) {
         settings.update_genesis_era_parameters(|parameters| {
             parameters.cryptarchia.security_param = NonZero::new(self.security_parameter)
                 .expect("named Blend diagnostic security parameter must be non-zero");
             parameters.cryptarchia.uncle_reference_window_in_block =
-                NonZeroU32::new(self.uncle_reference_window_in_block())
+                NonZeroU32::new(self.uncle_reference_window_in_block)
                     .expect("named Blend diagnostic uncle reference window must be non-zero");
             parameters.time.slot_duration_in_seconds = NonZero::new(self.slot_duration_secs)
                 .expect("named Blend diagnostic slot duration must be non-zero");
@@ -260,10 +253,6 @@ impl BlendDiagnosticParameterSet {
         self.apply_to(&mut settings);
         settings
     }
-}
-
-fn diagnostic_uncle_reference_window(default_window: u32, security_parameter: u32) -> u32 {
-    default_window.min(security_parameter.saturating_sub(1).max(1))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -386,7 +375,7 @@ pub fn set_blend_diagnostic_parameter_set(
         world,
         step,
         "eras.0.cryptarchia.uncle_reference_window_in_block",
-        &parameter_set.uncle_reference_window_in_block().to_string(),
+        &parameter_set.uncle_reference_window_in_block.to_string(),
     )?;
     set_deployment_config_override(
         world,
@@ -1844,19 +1833,6 @@ mod tests {
     fn unknown_named_parameter_set_is_rejected() {
         assert!(BlendDiagnosticParameterSet::from_name("accelerated").is_none());
         assert!(BlendDiagnosticParameterSet::from_name("unknown").is_none());
-    }
-
-    #[test]
-    fn uncle_reference_window_keeps_the_k_one_boundary_nonzero() {
-        for (security_parameter, expected_window) in
-            [(1, 1), (3, 2), (5, 4), (10, 9), (15, 12), (35, 12)]
-        {
-            assert_eq!(
-                diagnostic_uncle_reference_window(12, security_parameter),
-                expected_window
-            );
-        }
-        assert_eq!(diagnostic_uncle_reference_window(8, 20), 8);
     }
 
     #[test]

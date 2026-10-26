@@ -1,4 +1,4 @@
-use std::num::NonZero;
+use std::num::{NonZero, NonZeroU64};
 
 use lb_pol::LotteryConstants;
 use lb_utils::math::{NonNegativeF64, NonNegativeRatio};
@@ -96,6 +96,14 @@ impl Config {
         base_period_length(self.security_param, self.slot_activation_coeff)
     }
 
+    /// `s = 3⌊k/f⌋`: sufficient slots such that `k` blocks have been produced
+    /// with high probability.
+    #[must_use]
+    pub const fn slot_security_param(&self) -> NonZero<u64> {
+        self.base_period_length()
+            .saturating_mul(NonZero::new(3).expect("3 is non-zero"))
+    }
+
     #[must_use]
     pub const fn stake_inference_learning_rate(&self) -> f64 {
         self.stake_inference_learning_rate.get()
@@ -163,6 +171,16 @@ pub const fn expected_blocks_per_epoch(
     }
 }
 
+/// `⌊0.6k⌋`, the upper bound on uncle reference window (`W` blocks).
+///
+/// Keeping the uncle reference window within the finalization window ensures
+/// the parent of any uncle a block may reference is still above LIB.
+#[must_use]
+pub fn max_allowed_uncle_reference_window_in_block(security_param: NonZero<u32>) -> u32 {
+    let k = NonZeroU64::from(security_param); // widen to u64 to avoid overflow
+    u32::try_from(k.get() * 6 / 10).expect("0.6k must fit in u32")
+}
+
 #[cfg(test)]
 mod tests {
     use std::ops::Mul as _;
@@ -179,6 +197,7 @@ mod tests {
         );
         assert_eq!(config.security_param(), NonZero::new(10).unwrap());
         assert_eq!(config.base_period_length(), NonZero::new(50).unwrap());
+        assert_eq!(config.slot_security_param(), NonZero::new(150).unwrap());
         assert_eq!(
             config.uncle_reference_window_in_slot(),
             NonZero::new(60).unwrap()
@@ -188,6 +207,27 @@ mod tests {
             config.stake_inference_learning_rate().mul(10.0).floor() as u64,
             1,
         );
+    }
+
+    #[test]
+    fn test_max_allowed_uncle_reference_window_in_block() {
+        for (k, expected) in [
+            (1, 0),
+            (2, 1),
+            (3, 1),
+            (4, 2),
+            (5, 3),
+            (10, 6),
+            (30, 18),
+            (120, 72),
+            (u32::MAX, 2_576_980_377),
+        ] {
+            assert_eq!(
+                max_allowed_uncle_reference_window_in_block(NonZero::new(k).unwrap()),
+                expected,
+                "k={k}"
+            );
+        }
     }
 
     #[test]

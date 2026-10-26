@@ -110,6 +110,7 @@ pub struct RunState {
 #[derive(Debug, Default, Clone)]
 pub struct ManualNodeConfigOverrides {
     pub cryptarchia_security_param: Option<NonZero<u32>>,
+    pub cryptarchia_uncle_reference_window: Option<NonZero<u32>>,
     pub prolonged_bootstrap_period: Option<Duration>,
 }
 
@@ -153,6 +154,14 @@ impl ManualNodeConfigOverrides {
                 });
         }
 
+        if let Some(uncle_reference_window) = self.cryptarchia_uncle_reference_window {
+            config
+                .deployment
+                .update_genesis_era_parameters(|parameters| {
+                    parameters.cryptarchia.uncle_reference_window_in_block = uncle_reference_window;
+                });
+        }
+
         if let Some(prolonged_bootstrap_period) = self.prolonged_bootstrap_period {
             config
                 .user
@@ -165,6 +174,13 @@ impl ManualNodeConfigOverrides {
 
     pub const fn set_cryptarchia_security_param(&mut self, security_param: NonZero<u32>) {
         self.cryptarchia_security_param = Some(security_param);
+    }
+
+    pub const fn set_cryptarchia_uncle_reference_window(
+        &mut self,
+        uncle_reference_window: NonZero<u32>,
+    ) {
+        self.cryptarchia_uncle_reference_window = Some(uncle_reference_window);
     }
 
     pub const fn set_prolonged_bootstrap_period(&mut self, period: Duration) {
@@ -1173,6 +1189,17 @@ impl CucumberWorld {
         self.startup
             .manual_node_config_overrides
             .set_cryptarchia_security_param(security_param);
+    }
+
+    /// Set a scenario-wide cryptarchia uncle reference window override, in
+    /// blocks, for manual-cluster nodes.
+    pub const fn set_cryptarchia_uncle_reference_window(
+        &mut self,
+        uncle_reference_window: NonZero<u32>,
+    ) {
+        self.startup
+            .manual_node_config_overrides
+            .set_cryptarchia_uncle_reference_window(uncle_reference_window);
     }
 
     /// Set a scenario-wide prolonged bootstrap period override for

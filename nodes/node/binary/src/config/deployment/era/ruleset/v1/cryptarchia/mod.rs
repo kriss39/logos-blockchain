@@ -5,15 +5,15 @@ use lb_chain_service::Epoch;
 use lb_core::sdp::{InactivityPeriod, MinStake, ServiceType};
 use lb_cryptarchia_engine::{
     Config as ConsensusConfig, average_slots_for_blocks, base_period_length,
-    expected_blocks_per_epoch, time::epoch_length,
+    expected_blocks_per_epoch, max_allowed_uncle_reference_window_in_block, time::epoch_length,
 };
 use lb_groth16::ModulusShift;
 use lb_utils::math::{NonNegativeF64, NonNegativeRatio};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 pub(crate) mod codec;
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Debug, Clone)]
 pub struct Settings {
     pub epoch_config: EpochConfig,
     pub security_param: NonZeroU32,
@@ -25,7 +25,93 @@ pub struct Settings {
     pub pow_config: PoWConfig,
 }
 
+impl<'de> Deserialize<'de> for Settings {
+    /// Deserializes the settings and checks their invariants.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawSettings {
+            epoch_config: EpochConfig,
+            security_param: NonZeroU32,
+            slot_activation_coeff: NonNegativeRatio,
+            learning_rate: NonNegativeF64,
+            uncle_reference_window_in_block: NonZeroU32,
+            sdp_config: SdpConfig,
+            pow_config: PoWConfig,
+        }
+
+        let raw = RawSettings::deserialize(deserializer)?;
+        let settings = Self {
+            epoch_config: raw.epoch_config,
+            security_param: raw.security_param,
+            slot_activation_coeff: raw.slot_activation_coeff,
+            learning_rate: raw.learning_rate,
+            uncle_reference_window_in_block: raw.uncle_reference_window_in_block,
+            sdp_config: raw.sdp_config,
+            pow_config: raw.pow_config,
+        };
+        settings.validate().map_err(D::Error::custom)?;
+        Ok(settings)
+    }
+}
+
+/// Invariant violations in [`Settings`]
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum Error {
+    #[error(
+        "uncle reference window ({window} blocks) must not exceed ⌊0.6k⌋ = {max} blocks \
+         for security parameter k = {security_param}"
+    )]
+    UncleReferenceWindowTooWide {
+        security_param: NonZeroU32,
+        window: NonZeroU32,
+        max: u32,
+    },
+    #[error(
+        "uncle reference window ({window} slots) must not exceed a fifth of the slot \
+         security parameter s = {previous_slot_security_param} of the era before"
+    )]
+    UncleReferenceWindowBeyondPreviousSlotSecurityParam {
+        window: u64,
+        previous_slot_security_param: u64,
+    },
+}
+
 impl Settings {
+    /// Check the invariants between the consensus parameters. Run on
+    /// deserialization so a bad deployment config is rejected when it is
+    /// loaded.
+    pub fn validate(&self) -> Result<(), Error> {
+        let max = max_allowed_uncle_reference_window_in_block(self.security_param);
+        if self.uncle_reference_window_in_block.get() > max {
+            return Err(Error::UncleReferenceWindowTooWide {
+                security_param: self.security_param,
+                window: self.uncle_reference_window_in_block,
+                max,
+            });
+        }
+        Ok(())
+    }
+
+    /// Check the invariants between these settings and those of the next era.
+    pub fn validate_successor(&self, next: &Self) -> Result<(), Error> {
+        // Check `5⌊W_n/f_n⌋ ≤ s_{n−1}`
+        let window = next
+            .consensus_config()
+            .uncle_reference_window_in_slot()
+            .get();
+        let previous_slot_security_param = self.consensus_config().slot_security_param().get();
+        if u128::from(window) * 5 > u128::from(previous_slot_security_param) {
+            return Err(Error::UncleReferenceWindowBeyondPreviousSlotSecurityParam {
+                window,
+                previous_slot_security_param,
+            });
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub const fn slots_per_epoch(&self) -> u64 {
         epoch_length(
@@ -116,3 +202,72 @@ pub struct BlendPoWConfig {
 // directly: deserializing the deployment config runs its invariant checks
 // (`RewardPoWConfig::validate`), rejecting an invalid config at load time.
 pub use lb_ledger::config::RewardPoWConfig;
+
+#[cfg(test)]
+mod tests {
+    use lb_utils::math::NonNegativeRatio;
+
+    use super::{Error, Settings};
+    use crate::config::DeploymentSettings;
+
+    #[test]
+    fn uncle_reference_window_accepted() {
+        let settings = settings(10, 20, 6);
+        assert_eq!(settings.validate(), Ok(()));
+
+        let yaml = serde_yaml::to_string(&settings).unwrap();
+        assert!(serde_yaml::from_str::<Settings>(&yaml).is_ok());
+    }
+
+    #[test]
+    fn uncle_reference_window_rejected() {
+        let settings = settings(10, 20, 7);
+        let expected = Error::UncleReferenceWindowTooWide {
+            security_param: 10.try_into().unwrap(),
+            window: 7.try_into().unwrap(),
+            max: 6,
+        };
+        assert_eq!(settings.validate(), Err(expected.clone()));
+
+        let yaml = serde_yaml::to_string(&settings).unwrap();
+        let error = serde_yaml::from_str::<Settings>(&yaml).unwrap_err();
+        assert!(error.to_string().contains(&expected.to_string()), "{error}");
+    }
+
+    #[test]
+    fn next_era_uncle_reference_window_accepted() {
+        let previous = settings(10, 20, 6);
+        let next = settings(30, 20, 6);
+        // `W` is accepted because <= s/5.
+        assert_eq!(previous.validate_successor(&next), Ok(()));
+    }
+
+    #[test]
+    fn next_era_uncle_reference_window_rejected() {
+        // prev_slot_security_param: `s = 3*⌊10*20⌋ = 600` slots
+        let previous = settings(10, 20, 6);
+        // new_uncle_ref_window: `W = 7` (= 140 slot)
+        let next = settings(30, 20, 7);
+        // `W` is rejected because > s/5.
+        assert_eq!(
+            previous.validate_successor(&next),
+            Err(Error::UncleReferenceWindowBeyondPreviousSlotSecurityParam {
+                window: 140,
+                previous_slot_security_param: 600,
+            })
+        );
+    }
+
+    /// The default settings with `k`, `f = 1/f_denominator` and `W` replaced.
+    fn settings(security_param: u32, f_denominator: u32, window: u32) -> Settings {
+        let mut settings = DeploymentSettings::default()
+            .genesis_era_parameters()
+            .cryptarchia
+            .clone();
+        settings.security_param = security_param.try_into().unwrap();
+        settings.slot_activation_coeff =
+            NonNegativeRatio::new(1, f_denominator.try_into().unwrap());
+        settings.uncle_reference_window_in_block = window.try_into().unwrap();
+        settings
+    }
+}

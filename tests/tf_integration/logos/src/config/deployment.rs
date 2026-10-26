@@ -27,6 +27,7 @@ const DEFAULT_SLOT_TIME_IN_SECS: u64 = 1;
 const DEFAULT_ACTIVE_SLOT_COEFF: NonNegativeRatio =
     NonNegativeRatio::new(1, NonZeroU32::new(10).unwrap());
 const DEFAULT_SECURITY_PARAM: NonZeroU32 = NonZeroU32::new(20).unwrap();
+const DEFAULT_UNCLE_REFERENCE_WINDOW_IN_BLOCK: NonZeroU32 = NonZeroU32::new(12).unwrap();
 
 static RESERVED_AUTOMATIC_GENESIS_TIMES: LazyLock<Mutex<HashSet<GenesisTime>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -115,6 +116,7 @@ pub struct TopologyConfig {
     pub slot_duration: Option<Duration>,
     pub active_slot_coeff: NonNegativeRatio,
     pub security_param: NonZeroU32,
+    pub uncle_reference_window_in_block: NonZeroU32,
     node_config_overrides: HashMap<usize, RunConfig>,
     allow_multiple_genesis_tokens: bool,
     allow_zero_value_genesis_tokens: bool,
@@ -201,6 +203,8 @@ impl TopologyConfig {
     pub(crate) fn apply_deployment_overrides(&self, settings: &mut DeploymentSettings) {
         settings.update_genesis_era_parameters(|parameters| {
             parameters.cryptarchia.security_param = self.security_param;
+            parameters.cryptarchia.uncle_reference_window_in_block =
+                self.uncle_reference_window_in_block;
             parameters.cryptarchia.slot_activation_coeff = self.active_slot_coeff;
         });
     }
@@ -221,6 +225,7 @@ impl Default for TopologyConfig {
             slot_duration: Some(Duration::from_secs(DEFAULT_SLOT_TIME_IN_SECS)),
             active_slot_coeff: DEFAULT_ACTIVE_SLOT_COEFF,
             security_param: DEFAULT_SECURITY_PARAM,
+            uncle_reference_window_in_block: DEFAULT_UNCLE_REFERENCE_WINDOW_IN_BLOCK,
             node_config_overrides: HashMap::new(),
             allow_multiple_genesis_tokens: false,
             allow_zero_value_genesis_tokens: false,
@@ -284,6 +289,16 @@ impl DeploymentBuilder {
     #[must_use]
     pub const fn with_security_param(mut self, security_param: NonZeroU32) -> Self {
         self.config.security_param = security_param;
+        self
+    }
+
+    /// Overrides the node deployment's Cryptarchia uncle reference window.
+    #[must_use]
+    pub const fn with_uncle_reference_window_in_block(
+        mut self,
+        uncle_reference_window_in_block: NonZeroU32,
+    ) -> Self {
+        self.config.uncle_reference_window_in_block = uncle_reference_window_in_block;
         self
     }
 
