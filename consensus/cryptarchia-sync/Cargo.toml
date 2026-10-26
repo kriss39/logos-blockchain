@@ -28,7 +28,7 @@ rand                          = { workspace = true }
 serde                         = { workspace = true }
 serde_with                    = { features = ["macros"], workspace = true }
 thiserror                     = { workspace = true }
-tokio                         = { workspace = true }
+tokio                         = { features = ["macros", "sync", "time"], workspace = true }
 tracing                       = { workspace = true }
 
 [dev-dependencies]

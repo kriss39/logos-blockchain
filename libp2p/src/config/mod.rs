@@ -94,6 +94,7 @@ mod tests {
                 chain_sync_config: ChainSyncSettings {
                     peer_response_timeout: Duration::from_secs(5),
                     max_inbound_requests: 10.try_into().unwrap(),
+                    ..Default::default()
                 },
                 nat_config: nat::Settings::default(),
             }

@@ -86,6 +86,8 @@ impl ServiceConfig {
                     chain_sync_config: ChainSyncSettings {
                         peer_response_timeout: user.backend.swarm.chain_sync.peer_response_timeout,
                         max_inbound_requests: user.backend.swarm.chain_sync.max_inbound_requests,
+                        provider_send_timeout: user.backend.swarm.chain_sync.provider_send_timeout,
+                        download_buffer_bytes: user.backend.swarm.chain_sync.download_buffer_bytes,
                     },
                     nat_config: user.backend.swarm.nat.into(),
                 },

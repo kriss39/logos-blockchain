@@ -157,6 +157,7 @@ mod tests {
                 chain_sync_config: ChainSyncConfig {
                     peer_response_timeout: Duration::from_secs(1),
                     max_inbound_requests: NonZeroUsize::new(1).unwrap(),
+                    ..Default::default()
                 },
                 max_data_size_by_topic: HashMap::new(),
             },

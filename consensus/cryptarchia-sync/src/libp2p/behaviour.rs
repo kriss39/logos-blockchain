@@ -386,7 +386,13 @@ impl OngoingRequests {
         let (reply_sender, reply_receiver) = mpsc::channel(1);
 
         self.sending_block_responses.push(
-            async move { Provider::provide_blocks(reply_receiver, peer_id, stream).await }.boxed(),
+            Provider::provide_blocks(
+                reply_receiver,
+                peer_id,
+                stream,
+                self.config.provider_send_timeout,
+            )
+            .boxed(),
         );
 
         Poll::Ready(ToSwarm::GenerateEvent(Event::ProvideBlocksRequest {
@@ -422,13 +428,15 @@ impl OngoingRequests {
     }
 
     fn handle_blocks_request_available(&self, request_stream: BlocksRequestStream) {
-        self.receiving_block_responses.push(
-            ready(Downloader::receive_blocks(
-                request_stream,
-                self.config.peer_response_timeout,
-            ))
-            .boxed(),
-        );
+        let receiving = match Downloader::receive_blocks(
+            request_stream,
+            self.config.peer_response_timeout,
+            self.config.download_buffer_bytes,
+        ) {
+            Ok(reading) => reading.map(Ok).boxed(),
+            Err(e) => ready(Err(e)).boxed(),
+        };
+        self.receiving_block_responses.push(receiving);
 
         self.try_notify_waker();
     }
@@ -529,7 +537,13 @@ impl OngoingRequests {
             return Poll::Pending;
         }
 
-        if let Poll::Ready(Some(_)) = self.receiving_block_responses.poll_next_unpin(cx) {
+        if let Poll::Ready(Some(result)) = self.receiving_block_responses.poll_next_unpin(cx) {
+            if let Err(e) = result {
+                error!(target: LOG_TARGET, "Receiving blocks failed: {}", e);
+            }
+
+            self.try_notify_waker();
+
             return Poll::Pending;
         }
 
@@ -702,6 +716,7 @@ mod tests {
         let config = Config {
             peer_response_timeout: Duration::from_secs(1),
             max_inbound_requests: 4.try_into().unwrap(),
+            ..Config::default()
         };
         let (mut downloader_swarm, provider_peer_id) =
             start_provider_and_downloader(200, config).await;
@@ -729,6 +744,7 @@ mod tests {
         let config = Config {
             peer_response_timeout: Duration::from_secs(1),
             max_inbound_requests: 4.try_into().unwrap(),
+            ..Config::default()
         };
         let (mut downloader_swarm, provider_peer_id) =
             start_provider_and_downloader(1, config.clone()).await;
@@ -756,6 +772,7 @@ mod tests {
         let config = Config {
             peer_response_timeout: Duration::from_secs(1),
             max_inbound_requests: 4.try_into().unwrap(),
+            ..Config::default()
         };
         let (mut downloader_swarm, provider_peer_id) =
             start_provider_and_downloader(1, config).await;
@@ -783,6 +800,7 @@ mod tests {
         let config = Config {
             peer_response_timeout: Duration::from_secs(1),
             max_inbound_requests: 4.try_into().unwrap(),
+            ..Config::default()
         };
         let (mut downloader_swarm, provider_peer_id) =
             start_provider_and_downloader(0, config).await;
@@ -805,6 +823,7 @@ mod tests {
         let config = Config {
             peer_response_timeout: Duration::from_secs(5),
             max_inbound_requests: 4.try_into().unwrap(),
+            ..Config::default()
         };
         let (provider_swarm, provider_peer_id, provider_addr) =
             setup_provider_swarm(config.clone());
@@ -887,6 +906,7 @@ mod tests {
         let config = Config {
             peer_response_timeout: Duration::from_secs(1),
             max_inbound_requests: 4.try_into().unwrap(),
+            ..Config::default()
         };
         let mut provider_swarm = new_swarm_with_quic(config.clone());
         let provider_swarm_peer_id = *provider_swarm.local_peer_id();
@@ -933,6 +953,7 @@ mod tests {
         let config = Config {
             peer_response_timeout: Duration::from_secs(1),
             max_inbound_requests: 4.try_into().unwrap(),
+            ..Config::default()
         };
         let (mut downloader_swarm, provider_peer_id) = start_rejecting_provider(config).await;
 
@@ -950,6 +971,7 @@ mod tests {
         let config = Config {
             peer_response_timeout: Duration::from_secs(1),
             max_inbound_requests: 4.try_into().unwrap(),
+            ..Config::default()
         };
         let (mut downloader_swarm, provider_peer_id) = start_rejecting_provider(config).await;
 
@@ -976,6 +998,7 @@ mod tests {
         let config = Config {
             peer_response_timeout: Duration::from_secs(1),
             max_inbound_requests: 4.try_into().unwrap(),
+            ..Config::default()
         };
         let (mut downloader_swarm, provider_peer_id) =
             start_provider_with_stream_error(config).await;
@@ -1003,6 +1026,7 @@ mod tests {
         let config = Config {
             peer_response_timeout: Duration::from_secs(1),
             max_inbound_requests: 4.try_into().unwrap(),
+            ..Config::default()
         };
         let (mut provider_swarm, provider_peer_id, mut downloader_swarm) =
             connect_provider_and_downloader(config).await;
@@ -1048,6 +1072,7 @@ mod tests {
         let config = Config {
             peer_response_timeout: Duration::from_secs(1),
             max_inbound_requests: 4.try_into().unwrap(),
+            ..Config::default()
         };
         let (mut provider_swarm, provider_peer_id, mut downloader_swarm) =
             connect_provider_and_downloader(config).await;
@@ -1096,6 +1121,7 @@ mod tests {
         let config = Config {
             peer_response_timeout: Duration::from_secs(1),
             max_inbound_requests: 4.try_into().unwrap(),
+            ..Config::default()
         };
         let (mut provider_swarm, provider_peer_id, mut downloader_swarm) =
             connect_provider_and_downloader(config).await;
@@ -1127,6 +1153,113 @@ mod tests {
 
         assert_eq!(blocks.len(), 0);
         assert_eq!(errors.len(), 1);
+    }
+
+    /// Enough block bytes to fill the transport's flow-control windows, so a
+    /// provider can't finish sending unless the downloader keeps reading.
+    const SLOT_TEST_BLOCKS: usize = 400;
+    const SLOT_TEST_BLOCK_SIZE: usize = 64 * 1024;
+
+    /// Starts one download that is never consumed, waits, then starts a
+    /// second one against a provider serving a single download at a time.
+    /// Returns the outcome of the second download.
+    async fn download_after_unconsumed_download(
+        provider_config: Config,
+        downloader_config: Config,
+    ) -> (Vec<SerialisedBlock>, Vec<ChainSyncError>) {
+        let (provider_swarm, provider_peer_id, provider_addr) =
+            setup_provider_swarm(provider_config);
+        tokio::spawn(run_provider(
+            provider_swarm,
+            LargeBlocksProvider {
+                blocks_count: SLOT_TEST_BLOCKS,
+                block_size: SLOT_TEST_BLOCK_SIZE,
+            },
+        ));
+        let mut downloader_swarm =
+            setup_downloader_and_connect(provider_addr, downloader_config).await;
+
+        let request = move |swarm: &mut Swarm<Behaviour>| {
+            request_download(
+                swarm,
+                1,
+                HeaderId::from([0; 32]),
+                HeaderId::from([0; 32]),
+                HeaderId::from([0; 32]),
+                &HashSet::new(),
+                provider_peer_id,
+            )
+        };
+
+        let unconsumed = request(&mut downloader_swarm);
+        let (command_sender, mut command_receiver) = mpsc::channel::<oneshot::Sender<_>>(1);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    Some(reply) = command_receiver.recv() => {
+                        drop(reply.send(request(&mut downloader_swarm)));
+                    }
+                    _ = downloader_swarm.select_next_some() => {}
+                }
+            }
+        });
+
+        // Hold the first download's stream without reading from it.
+        let _unconsumed_stream = unconsumed.into_iter().next().unwrap().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        command_sender.send(reply_sender).await.unwrap();
+        wait_block_messages(reply_receiver.await.unwrap()).await
+    }
+
+    fn single_slot_config() -> Config {
+        Config {
+            peer_response_timeout: Duration::from_secs(5),
+            max_inbound_requests: 1.try_into().unwrap(),
+            ..Config::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_lockstep_downloader_holds_provider_slot() {
+        let downloader_config = Config {
+            download_buffer_bytes: 1.try_into().unwrap(),
+            ..single_slot_config()
+        };
+
+        let (blocks, errors) =
+            download_after_unconsumed_download(single_slot_config(), downloader_config).await;
+
+        assert_eq!(blocks.len(), 0);
+        assert_eq!(errors.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_read_ahead_frees_provider_slot() {
+        let (blocks, errors) =
+            download_after_unconsumed_download(single_slot_config(), single_slot_config()).await;
+
+        assert_eq!(blocks.len(), SLOT_TEST_BLOCKS);
+        assert_eq!(errors.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_provider_send_timeout_frees_slot() {
+        let provider_config = Config {
+            provider_send_timeout: Duration::from_millis(500),
+            ..single_slot_config()
+        };
+        let downloader_config = Config {
+            download_buffer_bytes: 1.try_into().unwrap(),
+            ..single_slot_config()
+        };
+
+        let (blocks, errors) =
+            download_after_unconsumed_download(provider_config, downloader_config).await;
+
+        assert_eq!(blocks.len(), SLOT_TEST_BLOCKS);
+        assert_eq!(errors.len(), 0);
     }
 
     /// A provider and a downloader connected to each other, neither of them
@@ -1179,6 +1312,26 @@ mod tests {
                         .map(Ok),
                 )
                 .boxed(),
+            )
+        }
+    }
+
+    struct LargeBlocksProvider {
+        blocks_count: usize,
+        block_size: usize,
+    }
+
+    impl ProviderBehavior for LargeBlocksProvider {
+        fn handle_tip_request(&self) -> TipResponse {
+            ProviderResponse::Unavailable {
+                reason: GetTipResponseReason::NodeNotOnline,
+            }
+        }
+
+        fn handle_blocks_request(&self, _requested: usize) -> BlocksResponse {
+            let block = Bytes::from(vec![0; self.block_size]);
+            ProviderResponse::Available(
+                futures::stream::iter(iter::repeat_n(block, self.blocks_count).map(Ok)).boxed(),
             )
         }
     }

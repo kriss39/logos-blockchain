@@ -1,8 +1,14 @@
-use futures::stream;
+use std::{num::NonZeroUsize, sync::Arc};
+
+use futures::{FutureExt as _, future::BoxFuture, stream};
 use lb_log_targets::cryptarchia;
-use libp2p::{PeerId, StreamProtocol};
+use libp2p::{PeerId, Stream as Libp2pStream, StreamProtocol};
 use libp2p_stream::Control;
-use tokio::{sync::oneshot, time, time::Duration};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
+    time,
+    time::Duration,
+};
 use tracing::{debug, warn};
 
 use crate::{
@@ -92,54 +98,146 @@ impl Downloader {
         utils::close_stream(peer_id, stream).await
     }
 
+    /// Hands the consumer a stream of the blocks sent by the peer, and
+    /// returns a future that reads them off the wire.
+    ///
+    /// The future reads ahead of the consumer, buffering up to
+    /// `buffer_bytes` of blocks (always at least one block). This lets the
+    /// peer finish sending the batch, and free its download slot, while
+    /// earlier blocks are still being applied locally.
+    ///
+    /// The future completes when the peer ends the download, a read fails,
+    /// or the consumer drops the stream.
     pub fn receive_blocks(
         request_stream: BlocksRequestStream,
         timeout: Duration,
-    ) -> Result<(), ChainSyncError> {
-        let libp2p_stream = request_stream.stream;
-        let peer_id = request_stream.peer_id;
-        let reply_channel = request_stream.reply_channel;
+        buffer_bytes: NonZeroUsize,
+    ) -> Result<BoxFuture<'static, ()>, ChainSyncError> {
+        let BlocksRequestStream {
+            stream: libp2p_stream,
+            peer_id,
+            reply_channel,
+        } = request_stream;
 
-        #[expect(
-            closure_returning_async_block,
-            reason = "Signature expected by `try_unfold`"
-        )]
-        let stream = stream::try_unfold(libp2p_stream, move |mut stream| async move {
-            let response = time::timeout(timeout, unpack_from_reader(&mut stream)).await;
+        // Bytes of buffered blocks are accounted by semaphore permits, which
+        // travel with each block and are released once the consumer takes it.
+        let buffer_bytes = buffer_bytes.get().min(Semaphore::MAX_PERMITS);
+        let buffer = Arc::new(Semaphore::new(buffer_bytes));
+        let (sender, receiver) = mpsc::unbounded_channel();
 
-            match response {
-                Ok(Ok(DownloadBlocksResponse::Block(block))) => Ok(Some((block, stream))),
-                Ok(Ok(DownloadBlocksResponse::NoMoreBlocks)) => {
-                    utils::close_stream(peer_id, stream).await?;
-                    Ok(None)
-                }
-                Ok(Ok(DownloadBlocksResponse::Failure(reason))) => {
-                    utils::close_stream(peer_id, stream).await?;
-
-                    Err(ChainSyncError {
-                        peer: peer_id,
-                        kind: ChainSyncErrorKind::BlockProviderUnavailable(reason),
-                    })
-                }
-                Ok(Err(e)) => {
-                    drop(utils::close_stream(peer_id, stream).await);
-                    Err(ChainSyncError::from((peer_id, e)))
-                }
-                Err(e) => {
-                    drop(utils::close_stream(peer_id, stream).await);
-                    Err(ChainSyncError::from((peer_id, e)))
-                }
-            }
+        let blocks = stream::unfold(receiver, async |mut receiver| {
+            let (block, _permit): (_, Option<OwnedSemaphorePermit>) = receiver.recv().await?;
+            Some((block, receiver))
         });
 
-        let boxed_stream: BoxedStream<_> = Box::new(Box::pin(stream));
-        reply_channel
-            .send(boxed_stream)
-            .map_err(|_| ChainSyncError {
+        let boxed_stream: BoxedStream<_> = Box::new(Box::pin(blocks));
+        if reply_channel.send(boxed_stream).is_err() {
+            return Err(ChainSyncError {
                 peer: peer_id,
                 kind: ChainSyncErrorKind::ChannelSendError(
                     "Failed to send blocks stream".to_owned(),
                 ),
-            })
+            });
+        }
+
+        Ok(Self::read_blocks(
+            peer_id,
+            libp2p_stream,
+            timeout,
+            buffer,
+            buffer_bytes,
+            sender,
+        )
+        .boxed())
+    }
+
+    async fn read_blocks(
+        peer_id: PeerId,
+        mut stream: Libp2pStream,
+        timeout: Duration,
+        buffer: Arc<Semaphore>,
+        buffer_bytes: usize,
+        sender: BufferedBlocksSender,
+    ) {
+        let outcome = Self::forward_blocks(
+            peer_id,
+            &mut stream,
+            timeout,
+            &buffer,
+            buffer_bytes,
+            &sender,
+        )
+        .await;
+        let close_result = utils::close_stream(peer_id, stream).await;
+
+        // Blocks already buffered are still delivered before any error.
+        match outcome {
+            ForwardOutcome::Completed => {
+                if let Err(error) = close_result {
+                    drop(sender.send((Err(error), None)));
+                }
+            }
+            ForwardOutcome::Failed(error) => drop(sender.send((Err(error), None))),
+            ForwardOutcome::Dropped => {
+                debug!(target: LOG_TARGET, "Block download from peer {peer_id} dropped by consumer");
+            }
+        }
+    }
+
+    /// Reads blocks off `stream` into `sender` until the download ends.
+    async fn forward_blocks(
+        peer_id: PeerId,
+        stream: &mut Libp2pStream,
+        timeout: Duration,
+        buffer: &Arc<Semaphore>,
+        buffer_bytes: usize,
+        sender: &BufferedBlocksSender,
+    ) -> ForwardOutcome {
+        loop {
+            let response = tokio::select! {
+                () = sender.closed() => return ForwardOutcome::Dropped,
+                response = time::timeout(timeout, unpack_from_reader(&mut *stream)) => response,
+            };
+
+            let block = match response {
+                Ok(Ok(DownloadBlocksResponse::Block(block))) => block,
+                Ok(Ok(DownloadBlocksResponse::NoMoreBlocks)) => return ForwardOutcome::Completed,
+                Ok(Ok(DownloadBlocksResponse::Failure(reason))) => {
+                    return ForwardOutcome::Failed(ChainSyncError {
+                        peer: peer_id,
+                        kind: ChainSyncErrorKind::BlockProviderUnavailable(reason),
+                    });
+                }
+                Ok(Err(e)) => return ForwardOutcome::Failed(ChainSyncError::from((peer_id, e))),
+                Err(e) => return ForwardOutcome::Failed(ChainSyncError::from((peer_id, e))),
+            };
+
+            let permits = u32::try_from(block.len().clamp(1, buffer_bytes))
+                .expect("buffer bytes are bounded by Semaphore::MAX_PERMITS");
+            let permit = tokio::select! {
+                () = sender.closed() => return ForwardOutcome::Dropped,
+                permit = Arc::clone(buffer).acquire_many_owned(permits) => {
+                    permit.expect("download buffer semaphore is never closed")
+                }
+            };
+
+            if sender.send((Ok(block), Some(permit))).is_err() {
+                return ForwardOutcome::Dropped;
+            }
+        }
     }
 }
+
+enum ForwardOutcome {
+    /// The peer sent every block of the download.
+    Completed,
+    /// The download failed before the peer sent every block.
+    Failed(ChainSyncError),
+    /// The consumer dropped the stream of blocks.
+    Dropped,
+}
+
+type BufferedBlocksSender = mpsc::UnboundedSender<(
+    Result<SerialisedBlock, ChainSyncError>,
+    Option<OwnedSemaphorePermit>,
+)>;
