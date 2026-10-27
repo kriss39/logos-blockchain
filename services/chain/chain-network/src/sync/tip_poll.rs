@@ -9,7 +9,9 @@ use lb_utils::math::NonNegativeRatio;
 use overwatch::DynError;
 use tracing::{debug, warn};
 
-use crate::{TipPollConfig, metrics, network::NetworkAdapter, sync::LOG_TARGET};
+use crate::{
+    TipPollConfig, is_at_or_before_lib, metrics, network::NetworkAdapter, sync::LOG_TARGET,
+};
 
 /// Proactive tip-poll lag watchdog.
 ///
@@ -122,9 +124,7 @@ fn select_catchup_tip(
                 None
             }
         })
-        .filter(|(height, slot, _)| {
-            *height > local_height && !crate::is_at_or_before_lib(*slot, lib_slot)
-        })
+        .filter(|(height, slot, _)| *height > local_height && !is_at_or_before_lib(*slot, lib_slot))
         .max_by_key(|(height, slot, _)| (*height, u64::from(*slot)))
 }
 
