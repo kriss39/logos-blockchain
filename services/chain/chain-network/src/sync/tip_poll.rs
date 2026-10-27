@@ -59,7 +59,7 @@ where
         debug!(
             target: LOG_TARGET,
             local_height = info.height,
-            "tip poll: no sampled peer reported a tip ahead of us"
+            "tip poll: no sampled peer reported a tip ahead of us and past the LIB slot"
         );
         return None;
     };
